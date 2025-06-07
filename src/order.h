@@ -1,98 +1,132 @@
-#ifndef ORDER_MANAGER_HPP
-#define ORDER_MANAGER_HPP
+#pragma once
 
-#include "common.h"
+#include <string>
+#include "utils.h"       // For RFlowey::string or other utilities
+#include "database.h"    // For OrderedHashMap, SingleMap
+#include "datetime.h"
+#include "common.h"      // For UsernameKey, TrainID_t, hash_t (if not in utils)
 #include "user.h"
 #include "train.h"
-#include <fstream>
 
-enum class OrderStatus : char {
-    SUCCESS = 'S',
-    PENDING = 'P',
-    REFUNDED = 'R'
+enum class OrderStatus {
+  SUCCESS,
+  PENDING,
+  REFUNDED
 };
 
-struct OrderRecord {
-    int orderID;
-    char username[USERNAME_LEN];
-    char trainID[TRAIN_ID_LEN];
-    int departure_from_f_station_date_day;
-    char from_station_name[STATION_NAME_LEN];
-    char to_station_name[STATION_NAME_LEN];
-    int from_station_route_idx;
-    int to_station_route_idx;
-    int num_tickets;
-    int total_price;
-    int order_timestamp;
-    OrderStatus status;
+struct Order {
+  int command_ts;
+  OrderStatus status;
+  TrainID_t train_id;
+  int from_station_id;
+  int to_station_id;
+  TimeUtil::DateTime leave_time;
+  TimeUtil::DateTime arrive_time;
+  int price_per_ticket;
+  int num_tickets;
 
-    OrderRecord();
+  hash_t train_hash;
+  TimeUtil::DateTime original_train_date;
+  Station_idx_t from_station_idx;
+  Station_idx_t to_station_idx;
+
+  Order() = default;
+
+  Order(int ts, OrderStatus stat, const TrainID_t& tid,
+        int fs_id, int ts_id,
+        const TimeUtil::DateTime& lt, const TimeUtil::DateTime& at,
+        int ppt, int nt,
+        hash_t th, const TimeUtil::DateTime& otd, Station_idx_t fsi, Station_idx_t tsi)
+      : command_ts(ts), status(stat), train_id(tid),
+        from_station_id(fs_id), to_station_id(ts_id),
+        leave_time(lt), arrive_time(at),
+        price_per_ticket(ppt), num_tickets(nt),
+        train_hash(th), original_train_date(otd), from_station_idx(fsi), to_station_idx(tsi) {}
+
+  std::string format_status() const {
+    switch (status) {
+      case OrderStatus::SUCCESS: return "[success]";
+      case OrderStatus::PENDING: return "[pending]";
+      case OrderStatus::REFUNDED: return "[refunded]";
+      default: return "[unknown]";
+    }
+  }
+
+  std::string format_for_query() const {
+    std::ostringstream oss;
+    oss << format_status() << " "
+        << std::string(train_id.c_str()) << " ";
+    if (from_station_id >= 0 && static_cast<size_t>(from_station_id) < station_id_to_name_vec.size()) {
+      oss << station_id_to_name_vec[from_station_id];
+    } else { oss << "INVALID_ST_ID(" << from_station_id << ")"; }
+    oss << " " << leave_time.getFullString() << " -> ";
+    if (to_station_id >= 0 && static_cast<size_t>(to_station_id) < station_id_to_name_vec.size()) {
+      oss << station_id_to_name_vec[to_station_id];
+    } else { oss << "INVALID_ST_ID(" << to_station_id << ")"; }
+    oss << " " << arrive_time.getFullString() << " "
+        << price_per_ticket << " " << num_tickets;
+    return oss.str();
+  }
 };
 
-struct UserOrderKey {
-    FixedString<USERNAME_LEN> username;
-    int inverted_timestamp;
-
-    bool operator<(const UserOrderKey& other) const;
-    bool operator==(const UserOrderKey& other) const;
+using WaitlistKey = RFlowey::pair<hash_t, TimeUtil::DateTime>;
+struct WaitlistKeyHasher {
+  hash_t operator()(const WaitlistKey& key) {
+    return (key.first*33)^RFlowey::hash(key.second.getRawMinutes());
+  }
 };
 
-struct PendingOrderQueueKey {
-    int order_timestamp;
-    int orderID;
+struct WaitlistEntry {
+    int command_ts;
+    hash_t user_hash;
+    int start_idx;
+    int end_idx;
+    int num_tickets_needed;
 
-    bool operator<(const PendingOrderQueueKey& other) const;
-    bool operator==(const PendingOrderQueueKey& other) const;
+    static bool sortByTimestamp(const WaitlistEntry& a, const WaitlistEntry& b) {
+        return a.command_ts < b.command_ts;
+    }
+
+  bool operator<(const WaitlistEntry& other) const {
+      return command_ts < other.command_ts;
+  }
+  bool operator==(const WaitlistEntry& other) const {
+      return command_ts == other.command_ts;
+  }
 };
+
+using OrderKey = RFlowey::pair<hash_t,int>;
 
 class OrderManager {
-private:
-    std::fstream orders_file;
-    std::fstream system_counters_file;
-
-    const std::string orders_filename = "orders.dat";
-    const std::string counters_filename = "system_counters.dat";
-    const std::string user_order_idx_filename = "orders_user_timestamp_idx.bpt";
-    const std::string pending_idx_filename = "pending_orders_queue.bpt";
-
-    void* orders_user_timestamp_idx_ptr;
-    void* pending_orders_queue_idx_ptr;
-
-    int next_order_id_counter;
-
-    UserManager* user_manager_ptr;
-    TrainManager* train_manager_ptr;
-
-    void loadNextOrderID();
-    void saveNextOrderID();
-    int getNextOrderID();
-
-    bool readOrderRecord(long offset, OrderRecord& record_out);
-    bool writeOrderRecord(long offset, const OrderRecord& record_in);
-    long appendOrderRecord(OrderRecord& record_in);
-
-    void attemptToFulfillPendingOrders();
+  SingleMap<OrderKey, Order> user_orders_;
+  OrderedHashMap<WaitlistKey, WaitlistEntry,WaitlistKeyHasher> waitlist_;
 
 public:
-    OrderManager();
-    ~OrderManager();
+  constexpr static std::string db_path_prefix = "order_data";
 
-    void init(UserManager* um, TrainManager* tm);
-    void clean();
+  OrderManager() : user_orders_(db_path_prefix + "_user_orders.dat"),
+                   waitlist_(db_path_prefix + "_waitlist.dat") {
+  }
 
-    int buyTicket(const std::string& username_str,
-                  const std::string& trainID_str,
-                  int departure_date_day_at_from_station,
-                  int num_tickets_to_buy,
-                  const std::string& from_station_str,
-                  const std::string& to_station_str,
-                  bool allow_queueing,
-                  int command_timestamp,
-                  std::string& result_msg_out);
+  void record_order(const UsernameKey& user_key,const Order& order);
+  sjtu::vector<WaitlistEntry> get_wait_list(const WaitlistKey& key);
+  std::string query_order(const UsernameKey &user_key);
 
-    int queryOrder(const std::string& username_str);
+  bool update_order_status(const OrderKey &key, OrderStatus new_status);
 
-    int refundTicket(const std::string& username_str, int order_index_in_list);
+  void remove_from_waitlist(const WaitlistKey &wk, const WaitlistEntry &entry_to_remove);
+
+  struct RefundableOrderInfo {
+    Order order_data;
+    OrderKey key;
+  };
+  std::optional<RefundableOrderInfo> get_nth_refundable_order(const UsernameKey& user_key, int n);
+
+  // New method for refunding
+  int refund_order_for_user(const UsernameKey& user_key, int n, TrainManager& train_mgr);
+
+  void clear_data() {
+    user_orders_.clear();
+    waitlist_.clear();
+  }
 };
-
-#endif // ORDER_MANAGER_HPP
